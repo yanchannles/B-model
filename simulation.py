@@ -1263,7 +1263,7 @@ def apply_hydraulic_bc(st: State, cfg: Config) -> None:
 
     if cfg.source_halfwidth > 0.0:
         c = coords(cfg)
-        source_p = np.abs(c["xp"] - cfg.source_x) <= cfg.source_halfwidth
+        source_p = np.abs(c["xp"] - cfg.source_x) <= cfg.source_halfwidth + 0.5 * cfg.dx
         # Pf is cell-centred.  Enforce the prescribed value at the physical
         # bottom face halfway between the last interior and ghost P nodes.
         st.pf[ny, source_p] = (
@@ -1294,7 +1294,7 @@ def enforce_darcy_flux_bc(st: State, cfg: Config) -> None:
     # Bottom non-source: no vertical Darcy flux.  The source segment is left
     # untouched because it is computed by the Darcy update from the prescribed
     # Pf ghost-row boundary value.
-    source_q = np.abs(c["xvy"] - cfg.source_x) <= cfg.source_halfwidth
+    source_q = np.abs(c["xvy"] - cfg.source_x) <= cfg.source_halfwidth + 0.5 * cfg.dx
     st.qyD[ny - 1, ~source_q] = 0.0
 
     # qyD[ny, :] is a ghost row and is not used as the physical source flux.
