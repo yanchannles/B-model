@@ -1406,20 +1406,21 @@ def initial_state(cfg: Config) -> State:
 
 
 def interpolate_markers_to_nodes(st: State, cfg: Config, *, with_stress: bool) -> None:
-    """MOD4: align marker->node nonlinear properties with B, keep D air mixing.
+    """MOD5: align sticky-air mixing with B, keep D marker-first rock properties.
 
-    Rock-only nodes use B's grid-first order: marker phi -> nodal phi -> eta/xi/k.
-    ETA/XI carried histories are capped by the current nodal unyielded laws.
-    At nodes touched by sticky-air markers, ETA0/XI0 deliberately retain D's
-    original arithmetic marker-property mixing so that air mixing itself is NOT
-    changed in this experiment.  Permeability is porosity-only, so it follows
-    B's grid-first PHIX/PHIY evaluation everywhere.
+    The rock-side unyielded ETA0/XI0 are still obtained from D's marker-evaluated
+    material properties.  Only nodes containing sticky-air markers change their
+    mixing rule: use B's air-fraction geometric blend with eta_air.  Permeability
+    remains D's marker-first average, and ETA/XI history capping is deliberately
+    NOT added here so this version isolates the air-mixing change.
     """
     recharge_source_markers(st, cfg)
 
     airm = (st.tm == 3).astype(float)
+    rockm = st.tm != 3
     eta0m = material_matrix_viscosity(st.tm, st.phim, cfg)
     xiphi0m = material_xi0_viscosity(st.tm, st.phim, cfg)
+    k_over_eta_m = marker_permeability_over_eta(st.tm, st.phim, cfg)
     rhom = marker_density(st.tm, st.phim, cfg)
     fricm = np.where(st.tm == 1, cfg.fric_block, 0.0)
     cohm = np.full_like(st.xm, cfg.coh0)
@@ -1428,20 +1429,21 @@ def interpolate_markers_to_nodes(st: State, cfg: Config, *, with_stress: bool) -
     tenm[st.tm == 3] = 0.0
     invGm = np.full_like(st.xm, 1.0 / cfg.G0)
 
-    # Basic nodes: B grid-first rock law, but D arithmetic mixing wherever air contributes.
+    # Basic nodes: D marker-first rock law + B geometric sticky-air blend.
     bshape = (cfg.ny, cfg.nx)
-    acc_phi, w = scatter_to_grid(st.xm, st.ym, st.phim, bshape, cfg, x0=0.0, y0=0.0)
-    phiB = np.clip(average_scatter(acc_phi, w, cfg.phi_background), 0.0, 1.0)
+    _, w = scatter_to_grid(st.xm, st.ym, st.phim, bshape, cfg, x0=0.0, y0=0.0)
     acc_air, _ = scatter_to_grid(st.xm, st.ym, airm, bshape, cfg, x0=0.0, y0=0.0)
     airB = np.clip(average_scatter(acc_air, w, 0.0), 0.0, 1.0)
 
-    eta_grid_B = material_matrix_viscosity(np.ones(bshape, dtype=np.int64), phiB, cfg)
-    acc_eta0_D, _ = scatter_to_grid(st.xm, st.ym, eta0m, bshape, cfg, x0=0.0, y0=0.0)
-    eta0_D_airmix = average_scatter(acc_eta0_D, w, cfg.eta_background)
-    st.ETA0[...] = np.where(airB > 0.0, eta0_D_airmix, eta_grid_B)
+    if np.any(rockm):
+        acc_eta_rock, w_eta_rock = scatter_to_grid(st.xm[rockm], st.ym[rockm], eta0m[rockm], bshape, cfg, x0=0.0, y0=0.0)
+        eta_rock_D = average_scatter(acc_eta_rock, w_eta_rock, cfg.eta_background)
+    else:
+        eta_rock_D = np.full(bshape, cfg.eta_background, dtype=np.float64)
+    st.ETA0[...] = np.exp((1.0 - airB) * np.log(np.maximum(eta_rock_D, 1.0e-300)) + airB * math.log(cfg.eta_air))
 
-    acc_eta_hist, _ = scatter_to_grid(st.xm, st.ym, st.etavpm, bshape, cfg, x0=0.0, y0=0.0)
-    st.ETA[...] = np.minimum(average_scatter(acc_eta_hist, w, st.ETA0), st.ETA0)
+    acc, _ = scatter_to_grid(st.xm, st.ym, st.etavpm, bshape, cfg, x0=0.0, y0=0.0)
+    st.ETA[...] = average_scatter(acc, w, st.ETA0)
     st.YNY[...] = st.ETA < st.ETA0
 
     acc, _ = scatter_to_grid(st.xm, st.ym, invGm, bshape, cfg, x0=0.0, y0=0.0)
@@ -1458,33 +1460,37 @@ def interpolate_markers_to_nodes(st: State, cfg: Config, *, with_stress: bool) -
         st.SXY0[...] = average_scatter(acc, w, 0.0)
         st.SXY[...] = st.SXY0
 
-    # Vx/Vy nodes: B grid-first permeability/mobility from nodal staggered phi.
+    # Vx/Vy nodes: unchanged D marker-first permeability/mobility construction.
     pshape = (cfg.ny1, cfg.nx1)
     acc, wvx = scatter_to_grid(st.xm, st.ym, st.phim, pshape, cfg, x0=0.0, y0=-cfg.dy / 2.0, max_i0=cfg.ny - 1, max_j0=cfg.nx - 2)
     st.PHIX[...] = np.clip(average_scatter(acc, wvx, cfg.phi_background), 0.0, 1.0)
-    st.KXOE[...] = marker_permeability_over_eta(np.ones_like(st.PHIX), st.PHIX, cfg)
+    acc, _ = scatter_to_grid(st.xm, st.ym, k_over_eta_m, pshape, cfg, x0=0.0, y0=-cfg.dy / 2.0, max_i0=cfg.ny - 1, max_j0=cfg.nx - 2)
+    st.KXOE[...] = average_scatter(acc, wvx, cfg.kphi_background / cfg.etafluid)
 
     acc, wvy = scatter_to_grid(st.xm, st.ym, st.phim, pshape, cfg, x0=-cfg.dx / 2.0, y0=0.0, max_i0=cfg.ny - 2, max_j0=cfg.nx - 1)
     st.PHIY[...] = np.clip(average_scatter(acc, wvy, cfg.phi_background), 0.0, 1.0)
-    st.KYOE[...] = marker_permeability_over_eta(np.ones_like(st.PHIY), st.PHIY, cfg)
+    acc, _ = scatter_to_grid(st.xm, st.ym, k_over_eta_m, pshape, cfg, x0=-cfg.dx / 2.0, y0=0.0, max_i0=cfg.ny - 2, max_j0=cfg.nx - 1)
+    st.KYOE[...] = average_scatter(acc, wvy, cfg.kphi_background / cfg.etafluid)
 
-    # P nodes: B grid-first rock xi law, but D arithmetic mixing wherever air contributes.
-    acc_phi_p, wp = scatter_to_grid(st.xm, st.ym, st.phim, pshape, cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
+    # P nodes: D marker-first rock xi law + B geometric sticky-air blend.
+    acc_phi, wp = scatter_to_grid(st.xm, st.ym, st.phim, pshape, cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
     acc_rho, _ = scatter_to_grid(st.xm, st.ym, rhom, pshape, cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
     st.RHO[...] = average_scatter(acc_rho, wp, cfg.rho_solid)
     copy_pnode_edges(st.RHO)
-    st.PHI[...] = np.clip(average_scatter(acc_phi_p, wp, cfg.phi_background), 0.0, 1.0)
+    st.PHI[...] = np.clip(average_scatter(acc_phi, wp, cfg.phi_background), 0.0, 1.0)
 
     acc_air_p, _ = scatter_to_grid(st.xm, st.ym, airm, pshape, cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
     airP = np.clip(average_scatter(acc_air_p, wp, 0.0), 0.0, 1.0)
-    xi_grid_B = material_xi0_viscosity(np.ones(pshape, dtype=np.int64), st.PHI, cfg)
-    acc_xi0_D, _ = scatter_to_grid(st.xm, st.ym, xiphi0m, pshape, cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
-    xi0_D_airmix = average_scatter(acc_xi0_D, wp, cfg.xi_background)
-    st.XI0[...] = np.where(airP > 0.0, xi0_D_airmix, xi_grid_B)
+    if np.any(rockm):
+        acc_xi_rock, w_xi_rock = scatter_to_grid(st.xm[rockm], st.ym[rockm], xiphi0m[rockm], pshape, cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
+        xi_rock_D = average_scatter(acc_xi_rock, w_xi_rock, cfg.xi_background)
+    else:
+        xi_rock_D = np.full(pshape, cfg.xi_background, dtype=np.float64)
+    st.XI0[...] = np.exp((1.0 - airP) * np.log(np.maximum(xi_rock_D, 1.0e-300)) + airP * math.log(cfg.eta_air))
     copy_pnode_edges(st.XI0)
 
-    acc_xi_hist, _ = scatter_to_grid(st.xm, st.ym, st.xivpm, pshape, cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
-    st.XI[...] = np.minimum(average_scatter(acc_xi_hist, wp, st.XI0), st.XI0)
+    acc, _ = scatter_to_grid(st.xm, st.ym, st.xivpm, pshape, cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
+    st.XI[...] = average_scatter(acc, wp, st.XI0)
     copy_pnode_edges(st.XI)
     st.YNYT[...] = st.XI < st.XI0
     copy_pnode_edges(st.YNYT)
