@@ -1236,13 +1236,9 @@ def apply_velocity_bc(st: State, cfg: Config) -> None:
     st.vy[ny, :] = 0.0
     st.vx[ny, 1:nx - 1] = st.vx[ny - 1, 1:nx - 1]
 
-    # Outer top: traction (stress-free, anchored to cfg.surface_pressure)
-    # boundary -- aligned with B's half-cell top momentum balance instead of
-    # the old impermeable Dirichlet condition vy_top = 0.
-    # Interior top-row columns (1..nx-1) remain PT degrees of freedom and must
-    # not be overwritten here.  Only the two outer corners are mirrored.
-    st.vy[0, 0] = st.vy[0, 1]
-    st.vy[0, nx] = st.vy[0, nx - 1]
+    # Outer top of the sticky-air box: impermeable/free-slip.  The physical
+    # rock surface is the deformable air-rock marker interface 0.5 km below.
+    st.vy[0, :] = 0.0
 
     st.vx[0, 1:nx - 1] = st.vx[1, 1:nx - 1]
 
@@ -1686,18 +1682,6 @@ def solve_hm_fixed_eta(
         st.vy[vys] += dt_rho * force_y
         st.vydif[vys] = st.vy[vys] - st.vy_prev_iter[vys]
         st.vy_prev_iter[vys] = st.vy[vys]
-
-        # Outer top row (i=0): B-style half-cell traction balance,
-        #   2/dy*(SYY_total(1,j) - pr(1,j) + P_surface)
-        #   + d/dx SXY_total(0,j) + rho_air*g = 0.
-        # The top normal velocity is relaxed as an unknown instead of clamped.
-        force_y_top = (
-            2.0 / dy * (SYY_total[1, 1:nx] - st.pr[1, 1:nx] + cfg.surface_pressure)
-            + (SXY_total[0, 1:nx] - SXY_total[0, 0:nx - 1]) / dx
-            + cfg.rho_air * cfg.gravity
-        )
-        st.vy[0, 1:nx] += dt_rho * force_y_top
-
         apply_velocity_bc(st, cfg)
         apply_hydraulic_bc(st, cfg)
 
@@ -1956,9 +1940,14 @@ def compute_aphi(st: State, cfg: Config, dt_for_elastic: float) -> None:
     jp = slice(1, nx)
     phi_state, phi_fluid_mat, phi_solid_mat = material_phase_fractions(st.PHI[ip, jp], cfg)
     st.APHI.fill(0.0)
+    # B-style time-centred compaction rate: average old/new compaction pressure
+    # in the viscous term, while the elastic-storage term uses the centred
+    # pressure difference over the accepted physical timestep.
+    pc_new = st.pr[ip, jp] - st.pf[ip, jp]
+    pc_old = st.pr0[ip, jp] - st.pf0[ip, jp]
     st.APHI[ip, jp] = (
-        (st.pr[ip, jp] - st.pf[ip, jp]) / np.maximum(st.XI[ip, jp], 1.0e-300)
-        + ((st.pr[ip, jp] - st.pr0[ip, jp]) - (st.pf[ip, jp] - st.pf0[ip, jp])) / dt_for_elastic * st.BETTAPHI[ip, jp]
+        0.5 * (pc_new + pc_old) / np.maximum(st.XI[ip, jp], 1.0e-300)
+        + (pc_new - pc_old) / dt_for_elastic * st.BETTAPHI[ip, jp]
     ) / (phi_solid_mat * phi_fluid_mat)
     endpointP = (phi_state < cfg.phi_dry_crit) | (phi_state >= cfg.phi_full_crit)
     aphi_local = st.APHI[ip, jp]
@@ -1971,7 +1960,7 @@ def compute_pressure_node_velocities(st: State, cfg: Config) -> None:
     ny, nx = cfg.ny, cfg.nx
     vxleft = -cfg.strainrate * cfg.xsize / 2.0
     vxright = cfg.strainrate * cfg.xsize / 2.0
-    vytop = cfg.strainrate * cfg.ysize
+    vytop = 0.0
     vybottom = 0.0
 
     st.vxp.fill(0.0)
@@ -1985,8 +1974,7 @@ def compute_pressure_node_velocities(st: State, cfg: Config) -> None:
     st.vxp[:, nx] = 2.0 * vxright - st.vxp[:, nx - 1]
     st.vyp[1:ny - 1, 0] = st.vyp[1:ny - 1, 1]
     st.vyp[1:ny - 1, nx] = st.vyp[1:ny - 1, nx - 1]
-    # Use the actual solved top-face velocity for the marker-advection ghost row.
-    st.vyp[0, :] = 2.0 * st.vy[0, :] - st.vyp[1, :]
+    st.vyp[0, :] = 2.0 * vytop - st.vyp[1, :]
     st.vyp[ny, :] = 2.0 * vybottom - st.vyp[ny - 1, :]
 
 
@@ -2243,16 +2231,23 @@ def update_marker_stress_phi_and_advect(st: State, cfg: Config, dt: float) -> fl
     st.syym += interp_from_grid(dsyy, st.xm, st.ym, cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
     st.sxym += interp_from_grid(dsxy, st.xm, st.ym, cfg, x0=0.0, y0=0.0)
 
-    # Update porosity on rock markers using the actual marker timestep.
+    # B-style porosity update: evolve phi on its native P grid first, then
+    # interpolate only the nodal increment to rock markers.
     rocks = st.tm < 3
     if np.any(rocks):
-        aphim = interp_from_grid(st.APHI, st.xm[rocks], st.ym[rocks], cfg, x0=-cfg.dx / 2.0, y0=-cfg.dy / 2.0)
-        # Use the physical state, not the material-property regularization.
-        # The logistic update preserves exact phi=0 and phi=1 endpoints.
-        ph = np.clip(st.phim[rocks], 0.0, 1.0)
-        factor = np.exp(np.clip(aphim * dtm, -50.0, 50.0))
-        st.phim[rocks] = ph / ((1.0 - ph) * factor + ph)
-        st.phim[rocks] = np.clip(st.phim[rocks], 0.0, 1.0)
+        phi_grid_old = np.clip(st.PHI, 0.0, 1.0)
+        factor_grid = np.exp(np.clip(st.APHI * dtm, -50.0, 50.0))
+        phi_grid_new = phi_grid_old / ((1.0 - phi_grid_old) * factor_grid + phi_grid_old)
+        dphi_grid = phi_grid_new - phi_grid_old
+        dphim = interp_from_grid(
+            dphi_grid,
+            st.xm[rocks],
+            st.ym[rocks],
+            cfg,
+            x0=-cfg.dx / 2.0,
+            y0=-cfg.dy / 2.0,
+        )
+        st.phim[rocks] = np.clip(st.phim[rocks] + dphim, 0.0, 1.0)
 
         recharge_source_markers(st, cfg)
 
