@@ -1,8 +1,8 @@
 # B-model
 
-A numerical benchmark project for investigating **viscous diapirism**, based on the benchmark setup described by **Keller et al.**
+This repository contains a series of numerical benchmark models (B1–B7) developed to reproduce and investigate the viscous diapirism regime described by Keller et al. (2013).
 
-The purpose of this repository is to progressively develop and verify the numerical implementation of the diapir benchmark. The model has been developed through a sequence of versions, B1–B7, with each version introducing or testing specific numerical treatments.
+The models are based on the coupled two-phase magma dynamics formulation presented in Keller et al. (2013), with progressive development and testing of numerical treatments including boundary conditions, porosity evolution, marker-to-node property transfer, air mixing, and source-region treatment.
 
 ## Version History
 
@@ -65,4 +65,7 @@ The same versions can also be inspected through the **Tags** and **Commits** pag
 
 This benchmark is based on the viscous diapirism benchmark described by **Keller et al.**
 
-A full bibliographic reference can be added here.
+Keller, T., May, D. A., & Kaus, B. J. P. (2013).
+Numerical modelling of magma dynamics coupled to tectonic deformation of lithosphere and crust.
+Geophysical Journal International, 195(3), 1406–1442.
+DOI: 10.1093/gji/ggt306
